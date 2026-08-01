@@ -1,0 +1,4 @@
+psycopg2-binary==2.9.12
+matplotlib==3.11.1
+Faker==40.36.0
+confluent-kafka==2.15.0
