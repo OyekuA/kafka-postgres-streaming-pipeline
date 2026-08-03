@@ -2,23 +2,39 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timezone
-from uuid import uuid4
 
 from confluent_kafka import Producer
+from faker import Faker
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    stream=sys.stdout,
+)
 logger = logging.getLogger("producer")
 
 BOOTSTRAP_SERVERS = os.environ.get("BOOTSTRAP_SERVERS", "localhost:9092")
 TOPIC = os.environ.get("TOPIC", "raw-logs")
 
+EVENTS_PER_SECOND = 10_000
+WINDOW_SECONDS = 1.0
+TRANSACTION_TYPES = ("deposit", "withdrawal", "transfer", "payment")
+
+fake = Faker()
+
+
+_delivery_counts = {"delivered": 0, "failed": 0}
+
 
 def delivery_callback(err, msg):
     if err is not None:
+        _delivery_counts["failed"] += 1
         logger.error("Message delivery failed: %s", err)
     else:
-        logger.info(
+        _delivery_counts["delivered"] += 1
+        logger.debug(
             "Message delivered to %s [partition %s] at offset %s",
             msg.topic(),
             msg.partition(),
@@ -28,29 +44,55 @@ def delivery_callback(err, msg):
 
 def build_event():
     return {
-        "event_id": str(uuid4()),
+        "event_id": fake.uuid4(),
         "event_timestamp": datetime.now(timezone.utc).isoformat(),
-        "account_id": "acct-001",
-        "amount": 1234.56,
-        "transaction_type": "payment",
+        "account_id": fake.uuid4().replace("-", ""),
+        "amount": round(fake.random.uniform(0.01, 10000.0), 2),
+        "transaction_type": fake.random_element(TRANSACTION_TYPES),
     }
 
 
 def main():
     producer = Producer({"bootstrap.servers": BOOTSTRAP_SERVERS})
-    event = build_event()
     logger.info(
-        "Connecting to Kafka at %s, sending 1 event to topic '%s'",
+        "Connecting to Kafka at %s, producing %d events/sec to topic '%s'",
         BOOTSTRAP_SERVERS,
+        EVENTS_PER_SECOND,
         TOPIC,
     )
-    producer.produce(TOPIC, value=json.dumps(event).encode("utf-8"), callback=delivery_callback)
-    pending = producer.flush(timeout=10.0)
-    if pending:
-        logger.error("Flush timed out with %d message(s) pending delivery", pending)
-        sys.exit(1)
-    logger.info("Sent event: %s", json.dumps(event))
-    logger.info("Producer flushed successfully; exiting cleanly")
+    try:
+        while True:
+            batch_start = time.perf_counter()
+            events = [build_event() for _ in range(EVENTS_PER_SECOND)]
+            for event in events:
+                producer.produce(
+                    TOPIC,
+                    value=json.dumps(event).encode("utf-8"),
+                    callback=delivery_callback,
+                )
+                producer.poll(0)
+            elapsed = time.perf_counter() - batch_start
+            delivered = _delivery_counts["delivered"]
+            failed = _delivery_counts["failed"]
+            _delivery_counts["delivered"] = 0
+            _delivery_counts["failed"] = 0
+            logger.info(
+                "Sent %d events in %.3fs (~%.0f events/sec, %d delivered, %d failed)",
+                len(events),
+                elapsed,
+                len(events) / elapsed,
+                delivered,
+                failed,
+            )
+            sleep_leftover = WINDOW_SECONDS - elapsed
+            if sleep_leftover > 0:
+                time.sleep(sleep_leftover)
+    except KeyboardInterrupt:
+        logger.info("Interrupted; flushing pending messages")
+        pending = producer.flush(timeout=10.0)
+        if pending:
+            logger.warning("%d message(s) still pending after flush", pending)
+        logger.info("Producer stopped cleanly")
 
 
 if __name__ == "__main__":
