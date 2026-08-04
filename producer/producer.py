@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import signal
 import sys
 import time
 from datetime import datetime, timezone
@@ -17,14 +18,14 @@ logger = logging.getLogger("producer")
 
 BOOTSTRAP_SERVERS = os.environ.get("BOOTSTRAP_SERVERS", "localhost:9092")
 TOPIC = os.environ.get("TOPIC", "raw-logs")
-
-EVENTS_PER_SECOND = 10_000
+EVENTS_PER_SECOND = int(os.environ.get("EVENTS_PER_SECOND", "10000"))
+DURATION_SECONDS = int(os.environ.get("DURATION_SECONDS", "0"))
 WINDOW_SECONDS = 1.0
 TRANSACTION_TYPES = ("deposit", "withdrawal", "transfer", "payment")
 
 fake = Faker()
 
-
+_stop_requested = False
 _delivery_counts = {"delivered": 0, "failed": 0}
 
 
@@ -52,16 +53,35 @@ def build_event():
     }
 
 
+def handle_signal(signum, frame):
+    global _stop_requested
+    logger.info("Received signal %d; shutting down", signum)
+    _stop_requested = True
+
+
+def shutdown(producer, reason):
+    logger.info("%s; flushing pending messages", reason)
+    pending = producer.flush(timeout=10.0)
+    if pending:
+        logger.warning("%d message(s) still pending after flush", pending)
+    producer.close()
+    logger.info("Producer stopped cleanly")
+
+
 def main():
-    producer = Producer({"bootstrap.servers": BOOTSTRAP_SERVERS})
+    signal.signal(signal.SIGTERM, handle_signal)
+    producer = Producer({"bootstrap.servers": BOOTSTRAP_SERVERS, "acks": "all"})
     logger.info(
-        "Connecting to Kafka at %s, producing %d events/sec to topic '%s'",
+        "Connecting to Kafka at %s, producing %d events/sec to topic '%s' "
+        "(duration: %s)",
         BOOTSTRAP_SERVERS,
         EVENTS_PER_SECOND,
         TOPIC,
+        "indefinite" if DURATION_SECONDS == 0 else f"{DURATION_SECONDS}s",
     )
+    started = time.monotonic()
     try:
-        while True:
+        while not _stop_requested:
             batch_start = time.perf_counter()
             events = [build_event() for _ in range(EVENTS_PER_SECOND)]
             for event in events:
@@ -84,15 +104,15 @@ def main():
                 delivered,
                 failed,
             )
+            if DURATION_SECONDS > 0 and time.monotonic() - started >= DURATION_SECONDS:
+                break
             sleep_leftover = WINDOW_SECONDS - elapsed
             if sleep_leftover > 0:
                 time.sleep(sleep_leftover)
     except KeyboardInterrupt:
-        logger.info("Interrupted; flushing pending messages")
-        pending = producer.flush(timeout=10.0)
-        if pending:
-            logger.warning("%d message(s) still pending after flush", pending)
-        logger.info("Producer stopped cleanly")
+        shutdown(producer, "Interrupted")
+    else:
+        shutdown(producer, "Shutdown requested" if _stop_requested else "Duration elapsed")
 
 
 if __name__ == "__main__":

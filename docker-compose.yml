@@ -61,6 +61,11 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      TOPIC: raw-logs
+      EVENTS_PER_SECOND: 10000
+      DURATION_SECONDS: 0
 
   consumer:
     build: ./consumer
