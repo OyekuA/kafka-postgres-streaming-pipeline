@@ -75,6 +75,13 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: raw-logs
+      KAFKA_GROUP_ID: log-consumer-group
+      CONSUMER_POLL_TIMEOUT: 1.0
+      BATCH_SIZE: 100
+      FLUSH_INTERVAL_SECONDS: 5
 
   benchmark:
     build: ./benchmark
