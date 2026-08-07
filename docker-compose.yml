@@ -82,6 +82,7 @@ services:
       CONSUMER_POLL_TIMEOUT: 1.0
       BATCH_SIZE: 100
       FLUSH_INTERVAL_SECONDS: 5
+      POSTGRES_DSN: host=postgres dbname=streamingdb user=postgres password=postgres
 
   benchmark:
     build: ./benchmark

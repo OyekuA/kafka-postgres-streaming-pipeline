@@ -5,6 +5,7 @@ import signal
 import sys
 import time
 
+import psycopg2
 from confluent_kafka import Consumer
 
 logging.basicConfig(
@@ -20,14 +21,42 @@ KAFKA_GROUP_ID = os.environ.get("KAFKA_GROUP_ID", "log-consumer-group")
 CONSUMER_POLL_TIMEOUT = float(os.environ.get("CONSUMER_POLL_TIMEOUT", "1.0"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "100"))
 FLUSH_INTERVAL_SECONDS = int(os.environ.get("FLUSH_INTERVAL_SECONDS", "5"))
+POSTGRES_DSN = os.environ.get(
+    "POSTGRES_DSN",
+    "host=postgres dbname=streamingdb user=postgres password=postgres",
+)
 
 _stop_requested = False
+_db_connection = None
 
 
 def handle_signal(signum, frame):
     global _stop_requested
     logger.info("Received signal %d; shutting down", signum)
     _stop_requested = True
+
+
+def get_connection():
+    global _db_connection
+    if _db_connection is not None and not _db_connection.closed:
+        return _db_connection
+    if _db_connection is not None:
+        logger.info("Disconnected from Postgres; reconnecting")
+        try:
+            _db_connection.close()
+        except Exception:
+            pass
+        _db_connection = None
+    else:
+        logger.info("Connecting to Postgres")
+    try:
+        _db_connection = psycopg2.connect(POSTGRES_DSN)
+        _db_connection.autocommit = True
+    except Exception:
+        _db_connection = None
+        raise
+    logger.info("Connected to Postgres")
+    return _db_connection
 
 
 def flush_batch(events):
@@ -51,6 +80,10 @@ def main():
         KAFKA_GROUP_ID,
         BOOTSTRAP_SERVERS,
     )
+    try:
+        get_connection()
+    except Exception as exc:
+        logger.error("Could not connect to Postgres at startup: %s", exc)
     buffer = []
     last_flush = time.monotonic()
 
@@ -60,6 +93,11 @@ def main():
         logger.info(
             "Flushing %d events, %.3fs since last flush", len(buffer), now - last_flush
         )
+        try:
+            get_connection()
+        except Exception as exc:
+            logger.error("Postgres unavailable; deferring flush: %s", exc)
+            return
         flush_batch(buffer)
         buffer.clear()
         last_flush = now
@@ -90,6 +128,8 @@ def main():
         logger.info("Interrupted")
     finally:
         consumer.close()
+        if _db_connection is not None:
+            _db_connection.close()
         logger.info("Consumer stopped cleanly")
 
 
