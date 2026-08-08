@@ -144,16 +144,22 @@ def main():
         logger.info(
             "Flushing %d events, %.3fs since last flush", len(buffer), now - last_flush
         )
-        try:
-            get_connection()
-        except Exception as exc:
-            logger.error("Postgres unavailable; deferring flush: %s", exc)
-            return
-        try:
-            flush_batch(buffer, consumer)
-        except Exception:
-            logger.error("Batch flush failed; retaining buffer for retry")
-            return
+        attempt = 0
+        while True:
+            if _stop_requested:
+                logger.error(
+                    "Shutdown requested during flush; leaving %d events uncommitted",
+                    len(buffer),
+                )
+                return
+            attempt += 1
+            try:
+                flush_batch(buffer, consumer)
+            except Exception:
+                logger.error("DB down, retrying in 5s... (attempt %d)", attempt)
+                time.sleep(5)
+                continue
+            break
         buffer.clear()
         last_flush = now
 
@@ -182,6 +188,16 @@ def main():
     except KeyboardInterrupt:
         logger.info("Interrupted")
     finally:
+        if buffer:
+            try:
+                flush_batch(buffer, consumer)
+                buffer.clear()
+            except Exception as exc:
+                logger.error(
+                    "Final flush failed during shutdown: %s; "
+                    "offsets left uncommitted for re-delivery",
+                    exc,
+                )
         consumer.close()
         if _db_connection is not None:
             _db_connection.close()
