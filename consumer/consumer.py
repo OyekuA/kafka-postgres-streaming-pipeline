@@ -6,7 +6,7 @@ import sys
 import time
 
 import psycopg2
-from confluent_kafka import Consumer
+from confluent_kafka import Consumer, KafkaException, TopicPartition
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,8 +59,59 @@ def get_connection():
     return _db_connection
 
 
-def flush_batch(events):
-    logger.info("Flushing batch of %d events", len(events))
+def flush_batch(events, consumer):
+    global _db_connection
+    if not events:
+        return
+    placeholders = ",".join(["(%s, %s, %s, %s, %s)"] * len(events))
+    sql = (
+        "INSERT INTO transaction_events "
+        "(event_id, event_timestamp, account_id, amount, transaction_type) "
+        "VALUES " + placeholders + " ON CONFLICT DO NOTHING"
+    )
+    params = []
+    for _, event in events:
+        params.extend(
+            [
+                event["event_id"],
+                event["event_timestamp"],
+                event["account_id"],
+                event["amount"],
+                event["transaction_type"],
+            ]
+        )
+    try:
+        conn = get_connection()
+        started = time.monotonic()
+        with conn.cursor() as cursor:
+            cursor.execute(sql, params)
+        duration_ms = (time.monotonic() - started) * 1000
+    except psycopg2.Error as exc:
+        logger.error("Batch INSERT failed: %s", exc)
+        if _db_connection is not None:
+            try:
+                _db_connection.close()
+            except Exception:
+                pass
+            _db_connection = None
+        raise
+    offsets = [msg for msg, _ in events]
+    try:
+        consumer.commit(
+            offsets=[
+                TopicPartition(m.topic(), m.partition(), m.offset() + 1) for m in offsets
+            ],
+            asynchronous=False,
+        )
+    except KafkaException as exc:
+        logger.error("Offset commit failed: %s", exc)
+        raise
+    logger.info(
+        "Inserted %d events in %.2f ms; committed offsets up to %d",
+        len(events),
+        duration_ms,
+        max(msg.offset() for msg in offsets),
+    )
 
 
 def main():
@@ -98,7 +149,11 @@ def main():
         except Exception as exc:
             logger.error("Postgres unavailable; deferring flush: %s", exc)
             return
-        flush_batch(buffer)
+        try:
+            flush_batch(buffer, consumer)
+        except Exception:
+            logger.error("Batch flush failed; retaining buffer for retry")
+            return
         buffer.clear()
         last_flush = now
 
@@ -121,7 +176,7 @@ def main():
             except json.JSONDecodeError:
                 logger.warning("Skipping message with invalid JSON")
                 continue
-            buffer.append(event)
+            buffer.append((msg, event))
             if len(buffer) >= BATCH_SIZE:
                 do_flush()
     except KeyboardInterrupt:
