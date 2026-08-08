@@ -18,12 +18,14 @@ from producer.producer import build_event
 
 EVENT_COUNT = 10000
 SETTLE_SECONDS = 2.0
-BATCH_LINE_RE = re.compile(r"Inserted (\d+) events in")
+INDIVIDUAL_BATCH_SIZE = 1
+BATCH_LINE_RE = re.compile(r"Inserted (\d+) events in ([\d.]+) ms")
 
 TOPIC = os.environ.get("TOPIC", "raw-logs")
 GROUP_ID = os.environ.get("KAFKA_GROUP_ID", "log-consumer-group")
 BOOTSTRAP_SERVERS = os.environ.get("BOOTSTRAP_SERVERS", "localhost:9093")
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "100"))
+SINGLE_TRIAL = os.environ.get("SINGLE_TRIAL", "0") == "1"
 POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "1.0"))
 TIMEOUT_SECONDS = int(os.environ.get("TIMEOUT_SECONDS", "300"))
 POSTGRES_DSN = os.environ.get(
@@ -201,34 +203,105 @@ def count_batches_from_logs(compose):
     result = compose.run("logs", "consumer")
     batch_count = 0
     inserted_total = 0
+    durations_ms = []
     for line in result.stdout.splitlines():
         match = BATCH_LINE_RE.search(line)
         if match:
             batch_count += 1
             inserted_total += int(match.group(1))
-    return batch_count, inserted_total
+            durations_ms.append(float(match.group(2)))
+    return batch_count, inserted_total, durations_ms
 
 
 def main():
     configure_logging()
     try:
-        run_trial()
+        results = run_benchmark()
     except Exception as exc:
         logger.exception("Benchmark failed: %s", exc)
         raise SystemExit(2)
+    if len(results) == 2:
+        print_comparison(results)
+    if results[-1]["status"] == "timeout":
+        raise SystemExit(1)
 
 
-def run_trial():
+def run_benchmark():
+    batch_sizes = (
+        [BATCH_SIZE, INDIVIDUAL_BATCH_SIZE] if not SINGLE_TRIAL else [BATCH_SIZE]
+    )
+    results = []
+    for batch_size in batch_sizes:
+        results.append(run_trial(batch_size))
+        if results[-1]["status"] == "timeout":
+            break
+    return results
+
+
+def fmt_value(value):
+    if value is None:
+        return "n/a"
+    if isinstance(value, str):
+        return value
+    if isinstance(value, int):
+        return f"{value:,}"
+    return f"{value:,.2f}"
+
+
+def print_comparison(results):
+    headers = [
+        "Metric",
+        f"Batch ({results[0]['batch_size']})",
+        f"Individual ({results[1]['batch_size']})",
+    ]
+    rows = [
+        ("Total time (s)", "elapsed_seconds"),
+        ("Throughput (events/s)", "events_per_second"),
+        ("Batch count", "batch_count"),
+        ("Avg INSERT time (ms)", "avg_batch_insert_ms"),
+        ("Rows committed", "rows_committed"),
+        ("Status", "status"),
+    ]
+    lines = [headers]
+    for label, key in rows:
+        cells = [label]
+        for r in results:
+            if key == "elapsed_seconds" and r["status"] != "success":
+                cells.append("n/a")
+            else:
+                cells.append(fmt_value(r[key]))
+        lines.append(cells)
+    widths = [max(len(cells[i]) for cells in lines) for i in range(len(headers))]
+    print()
+    for cells in lines:
+        print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(cells)))
+    if not all(r["status"] == "success" for r in results):
+        return
+    ratio = results[1]["elapsed_seconds"] / results[0]["elapsed_seconds"]
+    if ratio > 1:
+        verdict = "batch mode is faster"
+    elif ratio < 1:
+        verdict = "individual mode is faster"
+    else:
+        verdict = "no difference"
+    print(
+        f"\nSpeedup ratio (individual time / batch time): {ratio:.2f}x "
+        f"({verdict})"
+    )
+
+
+def run_trial(batch_size):
     compose = DockerCompose(COMPOSE_FILE)
     check_services_running(compose)
     conn = connect_db(POSTGRES_DSN)
     batch_count = None
     inserted_total = 0
+    avg_insert_ms = None
     try:
         stop_services(compose)
         truncate_table(conn)
         reset_consumer_offsets(compose, TOPIC, GROUP_ID)
-        start_consumer(compose, BATCH_SIZE)
+        start_consumer(compose, batch_size)
         started = time.monotonic()
         produce_events(BOOTSTRAP_SERVERS, TOPIC, EVENT_COUNT)
         rows, elapsed = wait_for_rows(
@@ -236,9 +309,11 @@ def run_trial():
         )
         if rows >= EVENT_COUNT:
             time.sleep(SETTLE_SECONDS)
-            batch_count, inserted_total = count_batches_from_logs(compose)
+            batch_count, inserted_total, durations_ms = count_batches_from_logs(compose)
+            if durations_ms:
+                avg_insert_ms = sum(durations_ms) / len(durations_ms)
     finally:
-        restore_services(compose, BATCH_SIZE)
+        restore_services(compose, batch_size)
         conn.close()
     if batch_count is not None:
         events_per_second = EVENT_COUNT / elapsed
@@ -249,6 +324,8 @@ def run_trial():
             events_per_second,
             batch_count,
         )
+        if avg_insert_ms is not None:
+            logger.info("Average batch INSERT time: %.2f ms", avg_insert_ms)
         if inserted_total != EVENT_COUNT:
             logger.warning(
                 "Consumer logs show %d events inserted across %d batches",
@@ -260,14 +337,17 @@ def run_trial():
         summary = {
             "status": "success",
             "events": EVENT_COUNT,
-            "batch_size": BATCH_SIZE,
+            "batch_size": batch_size,
             "elapsed_seconds": round(elapsed, 3),
             "events_per_second": round(events_per_second, 2),
             "batch_count": batch_count,
             "rows_committed": rows,
+            "avg_batch_insert_ms": (
+                round(avg_insert_ms, 2) if avg_insert_ms is not None else None
+            ),
         }
         print(json.dumps(summary))
-        return
+        return summary
     logger.error(
         f"Only {rows:,}/{EVENT_COUNT:,} rows committed after "
         f"{format_timeout_label(TIMEOUT_SECONDS)}"
@@ -275,14 +355,15 @@ def run_trial():
     summary = {
         "status": "timeout",
         "events": EVENT_COUNT,
-        "batch_size": BATCH_SIZE,
+        "batch_size": batch_size,
         "elapsed_seconds": round(elapsed, 3),
         "events_per_second": None,
         "batch_count": None,
         "rows_committed": rows,
+        "avg_batch_insert_ms": None,
     }
     print(json.dumps(summary))
-    raise SystemExit(1)
+    return summary
 
 
 if __name__ == "__main__":
