@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import psycopg2
@@ -12,6 +13,7 @@ from confluent_kafka import Producer
 
 ROOT = Path(__file__).resolve().parent.parent
 COMPOSE_FILE = ROOT / "docker-compose.yml"
+RESULTS_DIR = ROOT / "benchmark" / "results"
 
 sys.path.insert(0, str(ROOT))
 from producer.producer import build_event
@@ -220,6 +222,9 @@ def main():
     except Exception as exc:
         logger.exception("Benchmark failed: %s", exc)
         raise SystemExit(2)
+    write_results(results)
+    if len(results) == 2 and all(r["status"] == "success" for r in results):
+        generate_chart(results)
     if len(results) == 2:
         print_comparison(results)
     if results[-1]["status"] == "timeout":
@@ -248,11 +253,16 @@ def fmt_value(value):
     return f"{value:,.2f}"
 
 
+def trial_label(index, batch_size):
+    mode = "Batch" if index == 0 else "Individual"
+    return f"{mode} ({batch_size})"
+
+
 def print_comparison(results):
     headers = [
         "Metric",
-        f"Batch ({results[0]['batch_size']})",
-        f"Individual ({results[1]['batch_size']})",
+        trial_label(0, results[0]["batch_size"]),
+        trial_label(1, results[1]["batch_size"]),
     ]
     rows = [
         ("Total time (s)", "elapsed_seconds"),
@@ -288,6 +298,49 @@ def print_comparison(results):
         f"\nSpeedup ratio (individual time / batch time): {ratio:.2f}x "
         f"({verdict})"
     )
+
+
+def write_results(results):
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    trials = [
+        {"name": trial_label(index, summary["batch_size"]), **summary}
+        for index, summary in enumerate(results)
+    ]
+    speedup_ratio = None
+    if len(results) == 2 and all(r["status"] == "success" for r in results):
+        speedup_ratio = round(
+            results[1]["elapsed_seconds"] / results[0]["elapsed_seconds"], 3
+        )
+    report = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "speedup_ratio": speedup_ratio,
+        "trials": trials,
+    }
+    with open(RESULTS_DIR / "benchmark_results.json", "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+        f.write("\n")
+
+
+def generate_chart(results):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    labels = [trial_label(index, r["batch_size"]) for index, r in enumerate(results)]
+    times = [r["elapsed_seconds"] for r in results]
+    fig, ax = plt.subplots(figsize=(7, 5))
+    bars = ax.bar(labels, times, width=0.55, color=["#1f77b4", "#d62728"])
+    ax.bar_label(bars, fmt="%.1f s", padding=3)
+    ax.set_ylabel("Total Time (seconds)")
+    ax.set_title("Batch vs Individual Write Latency")
+    ax.legend(bars, labels, loc="upper left")
+    ax.grid(axis="y", alpha=0.3)
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+    fig.savefig(RESULTS_DIR / "latency_comparison.png", dpi=150)
+    plt.close(fig)
 
 
 def run_trial(batch_size):
